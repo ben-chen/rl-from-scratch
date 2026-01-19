@@ -1,12 +1,13 @@
 from dataclasses import dataclass
 from typing import Literal, Self
 
-import torch
+import torch as t
+from tqdm import tqdm
 
 type Player = Literal["X", "O"]
 type Action = tuple[int, int]  # (row, column)
 type Reward = dict[Player, float]
-type Prob = torch.Tensor
+type Prob = t.Tensor
 type Step = tuple[State, Action, Reward, Prob]
 type Trajectory = list[Step]
 
@@ -108,35 +109,35 @@ def from_flat(index: int) -> Action:
 
 
 class TorchPolicy(Policy):
-    def __init__(self, model: torch.nn.Module):
+    def __init__(self, model: t.nn.Module):
         self.model = model
 
-    @staticmethod
-    def state_to_tensor(state: State) -> torch.Tensor:
+    def state_to_tensor(self, state: State) -> t.Tensor:
         if state.current_player == "X":
             x_val, o_val = 1.0, -1.0
         else:
             x_val, o_val = -1.0, 1.0
         mapping = {"X": x_val, "O": o_val, " ": 0.0}
-        board_tensor = torch.tensor(
+        board_tensor = t.tensor(
             [[mapping[state.board[r][c]] for c in range(3)] for r in range(3)],
-            dtype=torch.float32,
+            dtype=t.float32,
+            device=next(self.model.parameters()).device,
         ).flatten()
         return board_tensor
 
-    def probs(self, state: State) -> torch.Tensor:
+    def probs(self, state: State) -> t.Tensor:
         state_tensor = self.state_to_tensor(state)
         logits = self.model(state_tensor)
         valid_moves = state.valid_moves()
         valid_indices = [to_flat(action) for action in valid_moves]
-        valid_mask = torch.full((9,), False)
+        valid_mask = t.full((9,), False)
         valid_mask[valid_indices] = True
         logits[~valid_mask] = float("-inf")
-        probs = torch.softmax(logits, dim=0)
+        probs = t.softmax(logits, dim=0)
         return probs
 
-    def choose_action(self, probs: torch.Tensor) -> Action:
-        chosen_index = int(torch.multinomial(probs, 1).item())
+    def choose_action(self, probs: t.Tensor) -> Action:
+        chosen_index = int(t.multinomial(probs, 1).item())
         chosen_move = from_flat(chosen_index)
         return chosen_move
 
@@ -149,18 +150,19 @@ class TorchPolicy(Policy):
         return chosen_move
 
 
-class Mlp(torch.nn.Module):
-    def __init__(self):
+class Mlp(t.nn.Module):
+    def __init__(self, device: t.device):
         super().__init__()
-        self.embed = torch.nn.Linear(9, 128)
-        self.fc1 = torch.nn.Linear(128, 128)
-        self.fc2 = torch.nn.Linear(128, 128)
-        self.unembed = torch.nn.Linear(128, 9)
+        self.device = device
+        self.embed = t.nn.Linear(9, 128, device=device)
+        self.fc1 = t.nn.Linear(128, 128, device=device)
+        self.fc2 = t.nn.Linear(128, 128, device=device)
+        self.unembed = t.nn.Linear(128, 9, device=device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.relu(self.embed(x))
-        x = torch.relu(self.fc1(x)) + x
-        x = torch.relu(self.fc2(x)) + x
+    def forward(self, x: t.Tensor) -> t.Tensor:
+        x = t.relu(self.embed(x))
+        x = t.relu(self.fc1(x)) + x
+        x = t.relu(self.fc2(x)) + x
         x = self.unembed(x)
         return x
 
@@ -175,30 +177,35 @@ def reward_trajectory(trajectory: Trajectory, gamma: float) -> dict[Player, floa
     return total_rewards
 
 
-def trajectory_surrogate(trajectory: Trajectory, gamma: float) -> torch.Tensor:
+def trajectory_surrogate(
+    trajectory: Trajectory, gamma: float, entropy_factor: float
+) -> t.Tensor:
     reward = reward_trajectory(trajectory, gamma)
     # print(f"Trajectory reward: {reward}")
-    x_probs = torch.stack(
+    x_probs = t.stack(
         [
             step[3][to_flat(step[1])]
             for step in trajectory
             if step[0].current_player == "X"
         ]
     )
-    o_probs = torch.stack(
+    o_probs = t.stack(
         [
             step[3][to_flat(step[1])]
             for step in trajectory
             if step[0].current_player == "O"
         ]
     )
-    log_x_probs = torch.log(x_probs + 1e-10)
-    log_o_probs = torch.log(o_probs + 1e-10)
+    entropy = t.stack(
+        [-t.sum(step[3] * t.log(step[3] + 1e-10)) for step in trajectory]
+    ).sum()
+    log_x_probs = t.log(x_probs + 1e-10)
+    log_o_probs = t.log(o_probs + 1e-10)
     x_surrogate = reward["X"] * log_x_probs.sum()
     o_surrogate = reward["O"] * log_o_probs.sum()
     # print(f"X surrogate: {x_surrogate.item()}, O surrogate: {o_surrogate.item()}")
     # surrogate = reward["X"] * log_x_probs.sum() + reward["O"] * log_o_probs.sum()
-    return x_surrogate + o_surrogate
+    return x_surrogate + o_surrogate + entropy_factor * entropy
 
 
 @dataclass
@@ -222,7 +229,7 @@ def h2h(
     result2 = H2HResult(0, 0, 0, 0, 0, 0)
 
     # policy 1 plays as X, policy 2 as O
-    for _game_idx in range(num_games):
+    for _game_idx in tqdm(range(num_games)):
         state = State(current_player="X")
         while state.check_winner() == "NotFinished":
             if state.current_player == "X":
@@ -243,7 +250,7 @@ def h2h(
             result2.o_draws += 1
 
     # policy 2 plays as X, policy 1 as O
-    for _game_idx in range(num_games):
+    for _game_idx in tqdm(range(num_games)):
         state = State(current_player="X")
         while state.check_winner() == "NotFinished":
             if state.current_player == "X":
@@ -277,3 +284,11 @@ def h2h(
     print("-" * 80)
 
     return result1, result2
+
+
+def avg_entropy(trajectory: Trajectory) -> float:
+    entropy_sum = t.tensor(0.0)
+    for _state, _action, _reward, prob in trajectory:
+        entropy = -t.sum(prob * t.log(prob + 1e-10))
+        entropy_sum += entropy
+    return (entropy_sum / len(trajectory)).item()
