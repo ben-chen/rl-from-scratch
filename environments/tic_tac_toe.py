@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import Literal, Self
 
 import torch as t
-from tqdm import tqdm
 
 type Player = Literal["X", "O"]
 type Action = tuple[int, int]  # (row, column)
@@ -167,7 +166,10 @@ class Mlp(t.nn.Module):
         return x
 
 
-def reward_trajectory(trajectory: Trajectory, gamma: float) -> dict[Player, float]:
+def reward_trajectory(
+    trajectory: Trajectory,
+    gamma: float,
+) -> dict[Player, float]:
     total_rewards: dict[Player, float] = {"X": 0.0, "O": 0.0}
     discount = 1.0
     for _t, (_state, _action, reward, _prob) in enumerate(trajectory):
@@ -178,7 +180,11 @@ def reward_trajectory(trajectory: Trajectory, gamma: float) -> dict[Player, floa
 
 
 def trajectory_surrogate(
-    trajectory: Trajectory, gamma: float, entropy_factor: float
+    trajectory: Trajectory,
+    gamma: float,
+    entropy_factor: float,
+    x_baseline: float = 0.0,
+    o_baseline: float = 0.0,
 ) -> t.Tensor:
     reward = reward_trajectory(trajectory, gamma)
     # print(f"Trajectory reward: {reward}")
@@ -201,8 +207,8 @@ def trajectory_surrogate(
     ).sum()
     log_x_probs = t.log(x_probs + 1e-10)
     log_o_probs = t.log(o_probs + 1e-10)
-    x_surrogate = reward["X"] * log_x_probs.sum()
-    o_surrogate = reward["O"] * log_o_probs.sum()
+    x_surrogate = (reward["X"] - x_baseline) * log_x_probs.sum()
+    o_surrogate = (reward["O"] - o_baseline) * log_o_probs.sum()
     # print(f"X surrogate: {x_surrogate.item()}, O surrogate: {o_surrogate.item()}")
     # surrogate = reward["X"] * log_x_probs.sum() + reward["O"] * log_o_probs.sum()
     return x_surrogate + o_surrogate + entropy_factor * entropy
@@ -216,6 +222,18 @@ class H2HResult:
     o_draws: int
     x_losses: int
     o_losses: int
+    score: float
+    x_loss_rate: float
+    o_loss_rate: float
+
+
+def score(result: H2HResult) -> float:
+    total_games = result.x_wins + result.o_wins + result.x_draws + result.o_draws
+    if total_games == 0:
+        return 0.0
+    return (
+        result.x_wins + result.o_wins - result.x_losses - result.o_losses
+    ) / total_games
 
 
 def h2h(
@@ -224,12 +242,33 @@ def h2h(
     num_games: int = 5000,
     policy1_name: str = "Policy 1",
     policy2_name: str = "Policy 2",
+    print_stats: bool = True,
 ) -> tuple[H2HResult, H2HResult]:
-    result1 = H2HResult(0, 0, 0, 0, 0, 0)
-    result2 = H2HResult(0, 0, 0, 0, 0, 0)
+    result1 = H2HResult(
+        x_wins=0,
+        o_wins=0,
+        x_draws=0,
+        o_draws=0,
+        x_losses=0,
+        o_losses=0,
+        score=0.0,
+        x_loss_rate=0.0,
+        o_loss_rate=0.0,
+    )
+    result2 = H2HResult(
+        x_wins=0,
+        o_wins=0,
+        x_draws=0,
+        o_draws=0,
+        x_losses=0,
+        o_losses=0,
+        score=0.0,
+        x_loss_rate=0.0,
+        o_loss_rate=0.0,
+    )
 
     # policy 1 plays as X, policy 2 as O
-    for _game_idx in tqdm(range(num_games)):
+    for _game_idx in range(num_games):
         state = State(current_player="X")
         while state.check_winner() == "NotFinished":
             if state.current_player == "X":
@@ -250,7 +289,7 @@ def h2h(
             result2.o_draws += 1
 
     # policy 2 plays as X, policy 1 as O
-    for _game_idx in tqdm(range(num_games)):
+    for _game_idx in range(num_games):
         state = State(current_player="X")
         while state.check_winner() == "NotFinished":
             if state.current_player == "X":
@@ -270,20 +309,47 @@ def h2h(
             result2.x_draws += 1
             result1.o_draws += 1
 
-    print("-" * 80)
-    print(f"{policy1_name} winrate as X: {result1.x_wins / num_games:.2f}")
-    print(f"{policy1_name} winrate as O: {result1.o_wins / num_games:.2f}")
-    print(f"{policy1_name} drawrate as X: {result1.x_draws / num_games:.2f}")
-    print(f"{policy1_name} drawrate as O: {result1.o_draws / num_games:.2f}")
-    print("-" * 80)
+    if print_stats:
+        print("-" * 80)
+        print(f"{policy1_name} winrate as X: {result1.x_wins / num_games:.2f}")
+        print(f"{policy1_name} winrate as O: {result1.o_wins / num_games:.2f}")
+        print(f"{policy1_name} drawrate as X: {result1.x_draws / num_games:.2f}")
+        print(f"{policy1_name} drawrate as O: {result1.o_draws / num_games:.2f}")
+        print("-" * 80)
 
-    print(f"{policy2_name} winrate as X: {result2.x_wins / num_games:.2f}")
-    print(f"{policy2_name} winrate as O: {result2.o_wins / num_games:.2f}")
-    print(f"{policy2_name} drawrate as X: {result2.x_draws / num_games:.2f}")
-    print(f"{policy2_name} drawrate as O: {result2.o_draws / num_games:.2f}")
-    print("-" * 80)
+        print(f"{policy2_name} winrate as X: {result2.x_wins / num_games:.2f}")
+        print(f"{policy2_name} winrate as O: {result2.o_wins / num_games:.2f}")
+        print(f"{policy2_name} drawrate as X: {result2.x_draws / num_games:.2f}")
+        print(f"{policy2_name} drawrate as O: {result2.o_draws / num_games:.2f}")
+        print("-" * 80)
+
+    result1.score = score(result1)
+    result2.score = score(result2)
+    if num_games > 0:
+        result1.x_loss_rate = result1.x_losses / (num_games)
+        result1.o_loss_rate = result1.o_losses / (num_games)
+        result2.x_loss_rate = result2.x_losses / (num_games)
+        result2.o_loss_rate = result2.o_losses / (num_games)
 
     return result1, result2
+
+
+def results_policy_vs_random(
+    policy: Policy,
+    num_games: int = 5000,
+    policy_name: str = "Learned Policy",
+    random_policy_name: str = "Random Policy",
+) -> H2HResult:
+    random_policy = RandomPolicy()
+    result, _ = h2h(
+        policy,
+        random_policy,
+        num_games=num_games,
+        policy1_name=policy_name,
+        policy2_name=random_policy_name,
+        print_stats=False,
+    )
+    return result
 
 
 def avg_entropy(trajectory: Trajectory) -> float:
